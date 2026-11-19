@@ -1,0 +1,90 @@
+name: veilrun-run
+
+on:
+  workflow_call:
+    inputs:
+      nonce: { type: string, required: true }
+      command: { type: string, required: true }
+      runs-on: { type: string, default: ubuntu-latest }
+      timeout-minutes: { type: number, default: 30 }
+    secrets:
+      service: { required: true }
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  run:
+    name: run
+    runs-on: ${{ inputs.runs-on }}
+    timeout-minutes: ${{ inputs.timeout-minutes }}
+    defaults:
+      run:
+        shell: quiet {0}
+    env:
+      SERVICE: ${{ secrets.service }}
+      NONCE: ${{ inputs.nonce }}
+    steps:
+      - name: Setup
+        shell: bash
+        run: |
+          cat > "$RUNNER_TEMP/quiet" <<'QUIET'
+          #!/bin/bash
+          log="${RUNNER_TEMP:-/tmp}/quiet.log"
+          bash --noprofile --norc -e "$1" >>"$log" 2>&1
+          rc=$?
+          echo "step finished: exit $rc"
+          exit $rc
+          QUIET
+          sudo install -m 755 "$RUNNER_TEMP/quiet" /usr/local/bin/quiet
+          cat > "$RUNNER_TEMP/oidc.sh" <<'OIDC'
+          #!/bin/bash
+          curl -fsS -G -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" --data-urlencode "audience=${SERVICE%/}" "$ACTIONS_ID_TOKEN_REQUEST_URL" | jq -r .value
+          OIDC
+          chmod 700 "$RUNNER_TEMP/oidc.sh"
+          : > "$RUNNER_TEMP/quiet.log"
+
+      - name: Grant
+        run: |
+          case "$NONCE" in ''|*[!0-9a-f-]*) echo "bad nonce"; exit 1;; esac
+          jwt=$(bash "$RUNNER_TEMP/oidc.sh")
+          umask 077
+          curl -fsS -X POST "${SERVICE%/}/token" -H "authorization: Bearer $jwt" -H 'content-type: application/json' \
+            -d "{\"nonce\":\"$NONCE\"}" > "$RUNNER_TEMP/grant.json"
+
+      - name: Source
+        run: |
+          TOKEN=$(jq -r .token "$RUNNER_TEMP/grant.json"); REPO=$(jq -r .repo "$RUNNER_TEMP/grant.json"); SHA=$(jq -r .sha "$RUNNER_TEMP/grant.json")
+          umask 077; printf '%s' "$TOKEN" > "$RUNNER_TEMP/tok"
+          case "$SHA" in ''|*[!0-9a-f]*) echo "bad sha"; exit 1;; esac
+          [ "${#SHA}" -eq 40 ] || { echo "bad sha"; exit 1; }
+          git init -q "$RUNNER_TEMP/src"
+          cd "$RUNNER_TEMP/src" || exit 1
+          git -c credential.helper= fetch -q --no-tags --depth=1 "https://x-access-token:${TOKEN}@github.com/${REPO}.git" "$SHA"
+          git checkout -q FETCH_HEAD
+          rm -f "$RUNNER_TEMP/grant.json"
+
+      - name: Run
+        env:
+          COMMAND: ${{ inputs.command }}
+        run: |
+          cd "$RUNNER_TEMP/src" || exit 1
+          bash -c "$COMMAND"
+
+      - name: Report
+        if: ${{ always() }}
+        env:
+          JOB_STATUS: ${{ job.status }}
+        run: |
+          case "$JOB_STATUS" in success) state=success; desc="passed";; cancelled) state=error; desc="cancelled";; *) state=failure; desc="failed";; esac
+          tail -c 60000 "$RUNNER_TEMP/quiet.log" > "$RUNNER_TEMP/tail.log" || : > "$RUNNER_TEMP/tail.log"
+          sed -E -i 's#x-access-token:[^@[:space:]]*@#x-access-token:***@#g' "$RUNNER_TEMP/tail.log"
+          [ -f "$RUNNER_TEMP/tok" ] && curl -fsS --max-time 20 -X DELETE "https://api.github.com/installation/token" -H "Authorization: Bearer $(cat "$RUNNER_TEMP/tok")" -H "Accept: application/vnd.github+json" >/dev/null || true
+          rm -f "$RUNNER_TEMP/tok"
+          jwt=$(bash "$RUNNER_TEMP/oidc.sh") || exit 0
+          jq -n --arg nonce "$NONCE" --arg state "$state" --arg description "$desc" --rawfile log "$RUNNER_TEMP/tail.log" \
+            '{nonce:$nonce,state:$state,description:$description,log:$log}' \
+            | curl -fsS --max-time 30 -X POST "${SERVICE%/}/report" -H "authorization: Bearer $jwt" -H 'content-type: application/json' -d @- >/dev/null || true
+          rm -f "$RUNNER_TEMP/quiet.log" "$RUNNER_TEMP/tail.log" "$RUNNER_TEMP/grant.json" "$RUNNER_TEMP/tok"
+          rm -rf "$RUNNER_TEMP/src"

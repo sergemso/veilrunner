@@ -1,0 +1,70 @@
+name: veilrun-native
+
+on:
+  workflow_call:
+    inputs:
+      command: { type: string, required: true }
+      sha: { type: string, required: true }
+      runs-on: { type: string, default: ubuntu-latest }
+      timeout-minutes: { type: number, default: 30 }
+
+permissions:
+  contents: read
+  statuses: write
+
+jobs:
+  run:
+    name: run
+    runs-on: ${{ inputs.runs-on }}
+    timeout-minutes: 360
+    env:
+      REPO: ${{ github.repository }}
+      SHA: ${{ inputs.sha }}
+      COMMAND: ${{ inputs.command }}
+      LIMIT: ${{ inputs.timeout-minutes }}
+      GH_TOKEN: ${{ github.token }}
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+    steps:
+      - name: Status
+        id: check
+        timeout-minutes: 5
+        run: |
+          post() { curl -fsS -X POST "https://api.github.com/repos/$REPO/statuses/$SHA" -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
+            -d "$(jq -n --arg s "$1" --arg d "$2" --arg u "$RUN_URL" '{state:$s,context:"veilrun",description:$d,target_url:$u}')" >/dev/null; }
+          case "$SHA" in *[!0-9a-f]*|"") bad=1;; *) [ "${#SHA}" -eq 40 ] || bad=1;; esac
+          if [ -n "${bad:-}" ]; then echo "not a commit: refusing"; exit 1; fi
+          post pending "native run started"
+
+      - name: Run
+        id: run
+        run: |
+          git init -q src
+          cd src || exit 1
+          timeout 300 git -c credential.helper= fetch -q --no-tags --depth=1 "https://x-access-token:${GH_TOKEN}@github.com/${REPO}.git" "$SHA"
+          git checkout -q FETCH_HEAD
+          rc=0
+          t0=$(date +%s)
+          timeout -k 30s "${LIMIT}m" bash -c "$COMMAND" || rc=$?
+          echo "elapsed=$(( $(date +%s) - t0 ))" >> "$GITHUB_OUTPUT"
+          echo "rc=$rc" >> "$GITHUB_OUTPUT"
+          exit "$rc"
+
+      - name: Verdict
+        timeout-minutes: 5
+        if: ${{ always() && steps.check.outcome == 'success' }}
+        env:
+          RUN_OUTCOME: ${{ steps.run.outcome }}
+          RC: ${{ steps.run.outputs.rc }}
+          ELAPSED: ${{ steps.run.outputs.elapsed }}
+        run: |
+          limited() { [ "$RC" = 124 ] || { [ "$RC" = 137 ] && [ "${ELAPSED:-0}" -ge $((LIMIT * 60)) ]; }; }
+          case "$RUN_OUTCOME" in
+            success) state=success; desc="passed (native)";;
+            *) if limited; then state=error; desc="native run stopped at its ${LIMIT}-minute limit"; else state=failure; desc="failed (native)"; fi;;
+          esac
+          curl -fsS -X POST "https://api.github.com/repos/$REPO/statuses/$SHA" -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
+            -d "$(jq -n --arg s "$state" --arg d "$desc" --arg u "$RUN_URL" '{state:$s,context:"veilrun",description:$d,target_url:$u}')" >/dev/null
+
+      - name: Rejected commit
+        if: ${{ always() && steps.check.outcome == 'failure' }}
+        run: echo "the commit argument was refused before any checkout"
